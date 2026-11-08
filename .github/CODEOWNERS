@@ -1,0 +1,19 @@
+# Every change needs the owner's review: agents open PRs, the owner approves them.
+* @Asta-Builds
+
+# Red zone: changes here alter what agents may do, how secrets are kept, or what the
+# gates enforce. They are listed so the reason is on record; the rule above already applies.
+/.github/                     @Asta-Builds
+/AGENTS.md                    @Asta-Builds
+/CLAUDE.md                    @Asta-Builds
+/eslint.config.mjs            @Asta-Builds
+/knip.json                    @Asta-Builds
+/.jscpd.json                  @Asta-Builds
+/.gitleaks.toml               @Asta-Builds
+/.gitleaksignore              @Asta-Builds
+/drizzle/                     @Asta-Builds
+/src/server/db/schema.ts      @Asta-Builds
+/src/server/crypto.ts         @Asta-Builds
+/src/server/env.ts            @Asta-Builds
+/src/server/mcp/auth.ts       @Asta-Builds
+/src/app/api/mcp/             @Asta-Builds

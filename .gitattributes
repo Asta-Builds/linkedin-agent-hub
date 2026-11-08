@@ -1,0 +1,5 @@
+# Normalize line endings in the repository; check out with the platform's endings.
+* text=auto
+# Git hooks run under bash everywhere, including Git for Windows: keep LF.
+.githooks/* text eol=lf
+*.sh text eol=lf

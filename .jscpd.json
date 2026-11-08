@@ -1,0 +1,9 @@
+{
+  "threshold": 3.0,
+  "reporters": ["console"],
+  "path": ["src", "e2e"],
+  "ignore": ["**/node_modules/**", "**/.next/**", "**/drizzle/**", "**/*.test.ts", "**/*.spec.ts"],
+  "format": ["typescript", "tsx"],
+  "minLines": 10,
+  "minTokens": 50
+}

@@ -1,0 +1,96 @@
+name: CI Pipeline
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Run CI on any branch by hand. Such a run is not a PR's check: GitHub counts only
+  # the PR's own pull_request runs (agent PRs get theirs from agent-implementer.yml).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  quality:
+    name: Quality gates (lint, types, dead code, duplication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: ESLint (zero warnings; complexity, size and boundary rules)
+        run: npm run lint
+      - name: TypeScript
+        run: npm run typecheck
+      - name: Dead code and unused dependencies (knip)
+        run: npm run knip
+      - name: Duplication under 3% (jscpd)
+        run: npm run duplication
+
+  tests:
+    name: Tests and migrations (Vitest + Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: lah_test
+          POSTGRES_USER: lah
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://lah:test_password@localhost:5432/lah_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Migrations are consistent
+        run: npm run db:check
+      - name: Every schema change has a migration
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain drizzle/)" ]; then
+            echo "::error::src/server/db/schema.ts changed without a migration. Run npm run db:generate and commit drizzle/."
+            git status --porcelain drizzle/
+            exit 1
+          fi
+      - name: Apply migrations to an empty database
+        run: npm run db:migrate
+      - name: Unit and database tests
+        run: npm test
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build

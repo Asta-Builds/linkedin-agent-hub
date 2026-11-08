@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fast factory gates on staged files: ESLint, and a Gitleaks scan when gitleaks is installed.
+# The full set (types, knip, jscpd, migrations, tests, build) runs in `npm run check` and in CI.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Skip once, only when you must:  git commit --no-verify   (CI still runs every gate)
+
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+files="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx|mts|mjs)$' || true)"
+if [ -n "$files" ]; then
+  echo "pre-commit: ESLint on staged files"
+  # shellcheck disable=SC2086  # word-splitting the file list is intended
+  npx --no-install eslint --max-warnings 0 --no-warn-ignored $files
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: Gitleaks on the staged diff"
+  gitleaks git --pre-commit --staged --config .gitleaks.toml --redact
+else
+  echo "pre-commit: gitleaks is not installed; skipping the secret scan. CI still runs it." >&2
+fi

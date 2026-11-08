@@ -1,0 +1,364 @@
+name: Automated Implementer Agent
+
+# Factory loop: the owner labels a refined issue `agent`, Claude implements it here, the
+# deterministic gates re-check the result, and a PR opens for the owner's review.
+
+"on":
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  # No `actions` access here: only the start-checks job, where the agent does not run,
+  # gets `actions: write`.
+
+concurrency:
+  group: implementer-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  implement:
+    name: Implement & Verify Issue #${{ github.event.issue.number }}
+    if: github.event.label.name == 'agent' || github.event.label.name == 'agent:implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      pr_number: ${{ steps.cpr.outputs.pull-request-number }}
+      pr_head_sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
+      pr_operation: ${{ steps.cpr.outputs.pull-request-operation }}
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: lah_test
+          POSTGRES_USER: lah
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://lah:test_password@localhost:5432/lah_test
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      GIT_AUTHOR_NAME: "LinkedIn Agent Hub Implementer"
+      GIT_AUTHOR_EMAIL: "agent@linkedin-agent-hub.invalid"
+      GIT_COMMITTER_NAME: "LinkedIn Agent Hub Implementer"
+      GIT_COMMITTER_EMAIL: "agent@linkedin-agent-hub.invalid"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      # The agent always starts from the default branch, so a re-run starts over from the
+      # current rules. "Create Pull Request" creates or force-updates feature/issue-N itself;
+      # switching to a local-only branch here would break its reset to origin/<branch>.
+      - name: Configure git for the agent
+        run: |
+          git config user.name "LinkedIn Agent Hub Implementer"
+          git config user.email "agent@linkedin-agent-hub.invalid"
+
+      # Installed BEFORE the agent runs so it can run every gate and test inside its loop.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate a throwaway encryption key for this run
+        run: echo "TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+
+      - name: Migrate the CI database (so the agent can run the app and tests against it)
+        run: npm run db:migrate
+
+      - name: Run Claude Code Implementer Loop
+        id: implementer
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Runs on the owner's Claude Pro/Max plan. Create the token with `claude setup-token`
+          # and store it as the CLAUDE_CODE_OAUTH_TOKEN repository secret.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The agent must edit files and run the gates itself; without an explicit allow,
+          # claude-code-action denies writes. It only runs after a maintainer adds `agent`.
+          claude_args: >-
+            --max-turns 100
+            --allowedTools "Edit,MultiEdit,Write,Bash"
+            --strict-mcp-config
+          prompt: |
+            You are the LinkedIn Agent Hub Implementer Agent.
+            Follow every rule in AGENTS.md and CLAUDE.md. Read the Next.js guide in node_modules/next/dist/docs/ for any Next.js API you use.
+
+            Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+            Issue description:
+            ${{ github.event.issue.body }}
+
+            Before you finish, run `npm run check` (lint, types, knip, jscpd, migration check, unit tests) and `npm run build`, and fix everything they report.
+            If you change src/server/db/schema.ts, run `npm run db:generate` and commit the new migration in drizzle/.
+            Never hardcode secrets or tokens and never commit .env files. A Gitleaks scan of your changes runs before any PR is opened.
+
+      # Final deterministic re-check after the agent finishes. No AI decides pass/fail here.
+      - name: "Gate: ESLint (zero warnings)"
+        id: gate-lint
+        run: npm run lint
+
+      - name: "Gate: TypeScript (tsc)"
+        id: gate-types
+        run: npm run typecheck
+
+      - name: "Gate: Dead code (Knip)"
+        id: gate-knip
+        run: npm run knip
+
+      - name: "Gate: Duplication (jscpd)"
+        id: gate-jscpd
+        run: npm run duplication
+
+      - name: "Gate: Migrations match the schema"
+        id: gate-migrations
+        run: |
+          npm run db:check
+          npm run db:generate
+          if [ -n "$(git status --porcelain drizzle/)" ]; then
+            echo "::error::src/server/db/schema.ts changed without a migration. Run npm run db:generate and commit drizzle/."
+            git status --porcelain drizzle/
+            exit 1
+          fi
+
+      - name: "Gate: Unit and database tests (Vitest)"
+        id: gate-tests
+        run: |
+          npm run db:migrate
+          npm test
+
+      - name: "Gate: Production build"
+        id: gate-build
+        run: npm run build
+
+      - name: "Gate: Secret & Credential Leak Scan (Gitleaks)"
+        id: gate-gitleaks
+        env:
+          GITLEAKS_VERSION: "8.24.0"
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "${base}/${archive}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${archive}$" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks" && tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks && rm "$archive"
+          # The agent's work is still uncommitted here: stage it and scan exactly that diff,
+          # not the repo history (an old leak must not block every run).
+          git add -A
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --pre-commit --staged --config .gitleaks.toml --redact --verbose
+
+      - name: Create Pull Request
+        id: cpr
+        if: success()
+        # v7.0.9+ is required with actions/checkout@v6+ (v6 sent a duplicate Authorization header).
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: "feature/issue-${{ github.event.issue.number }}"
+          base: ${{ github.event.repository.default_branch || 'main' }}
+          title: "feat(agent): #${{ github.event.issue.number }} ${{ github.event.issue.title }}"
+          body: |
+            Autonomous Implementer Agent PR for #${{ github.event.issue.number }}.
+
+            ### Automated Quality Gates Passed
+            - [x] ESLint with zero warnings (complexity, size and boundary rules)
+            - [x] TypeScript (`tsc --noEmit`)
+            - [x] Dead code and unused dependencies (`knip`)
+            - [x] Duplication under 3% (`jscpd`)
+            - [x] Migrations match the schema (`drizzle-kit check` and `generate`)
+            - [x] Unit and database tests (`vitest`)
+            - [x] Production build (`next build`)
+            - [x] Secret scan of the changes (`gitleaks`)
+
+            The implementer run approves this PR's checks (CI, the secret scan and E2E): GitHub holds runs on PRs opened by the workflow token until someone approves them.
+
+            Closes #${{ github.event.issue.number }}
+          labels: |
+            agent-implemented
+            automated-pr
+          commit-message: "feat(agent): resolve issue #${{ github.event.issue.number }}"
+          committer: "LinkedIn Agent Hub Implementer <agent@linkedin-agent-hub.invalid>"
+          author: "LinkedIn Agent Hub Implementer <agent@linkedin-agent-hub.invalid>"
+          delete-branch: false
+
+      - name: Comment on Issue with PR Link
+        if: success() && steps.cpr.outputs.pull-request-number != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = context.payload.issue ? context.payload.issue.number : context.issue.number;
+            const prNumber = '${{ steps.cpr.outputs.pull-request-number }}';
+            const prUrl = '${{ steps.cpr.outputs.pull-request-url }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `🎉 **Implementer Agent Completed**: All deterministic verification gates passed.\n\nAutonomous Pull Request created: [#${prNumber}](${prUrl})`
+            });
+
+      - name: Handle Stuck Agent Failure
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        env:
+          # Outcomes of the steps that have an id; at most one fails, since later steps are skipped.
+          # Read from the run itself: the jobs API reports a step's failure only once the job ends.
+          STEPS_JSON: ${{ toJSON(steps) }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = context.payload.issue ? context.payload.issue.number : context.issue.number;
+            const isCancelled = '${{ job.status }}' === 'cancelled';
+            // Name the step that actually failed: a gate, the agent itself, or the plumbing around it.
+            const gates = {
+              'gate-lint': 'ESLint',
+              'gate-types': 'TypeScript (tsc)',
+              'gate-knip': 'dead code (Knip)',
+              'gate-jscpd': 'duplication (jscpd)',
+              'gate-migrations': 'migrations match the schema',
+              'gate-tests': 'unit and database tests',
+              'gate-build': 'production build',
+              'gate-gitleaks': 'secret scan (Gitleaks)',
+            };
+            let failedId = null;
+            try {
+              const steps = JSON.parse(process.env.STEPS_JSON || '{}');
+              failedId = Object.keys(steps).find((id) => steps[id].outcome === 'failure') ?? null;
+            } catch (error) {
+              core.warning(`Could not read the step outcomes: ${error.message}`);
+            }
+            const reason = isCancelled
+              ? 'exceeded the 25-minute hard timeout ceiling or was cancelled'
+              : gates[failedId]
+                ? `failed the ${gates[failedId]} gate`
+                : failedId === 'implementer'
+                  ? 'did not finish: it hit the turn cap or stopped with an error'
+                  : failedId === 'cpr'
+                    ? "could not open its pull request. That step is workflow plumbing, not the agent's code (see the run)"
+                    : "stopped at a setup step, which is workflow plumbing rather than the agent's code (see the run)";
+
+            console.log(`Applying 'factory-stuck' label to issue #${issueNumber}...`);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['factory-stuck']
+            });
+
+            console.log(`Posting diagnostic comment to issue #${issueNumber}...`);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const commentBody = [
+              `### ⚠️ Implementer Agent Stuck`,
+              ``,
+              `The automated implementer agent ${reason} for issue #${issueNumber}.`,
+              ``,
+              `**Execution Summary**:`,
+              `- **Run URL**: [GitHub Actions Run #${context.runNumber}](${runUrl})`,
+              `- **Status**: \`${{ job.status }}\``,
+              `- **Action Taken**: Applied \`factory-stuck\` label`,
+              `- **Triggering Label**: \`${context.payload.label ? context.payload.label.name : 'agent'}\``,
+              ``,
+              `> **Factory Rule**: Never fix the agent code by hand. Fix the factory rules (update \`CLAUDE.md\`, adjust gate rules, or clarify issue context) and re-label with \`agent\` to retry.`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: commentBody
+            });
+
+  # GitHub creates the PR's own pull_request runs (the only ones that count as its checks)
+  # but holds them for approval, because it treats github-actions[bot] as a first-time
+  # contributor. Approve them here. They run nothing the agent's job did not: GITHUB_TOKEN
+  # cannot push workflow files, CI and E2E use no secrets, and the secret scan runs no
+  # repository code. A separate job, so the job the agent runs in never holds `actions: write`.
+  start-checks:
+    name: Start the PR's checks
+    needs: implement
+    if: needs.implement.outputs.pr_number != '' && needs.implement.outputs.pr_operation != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: write
+    steps:
+      - name: Approve the PR's held CI, secret-scan and E2E runs
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.implement.outputs.pr_number }}
+          PR_HEAD_SHA: ${{ needs.implement.outputs.pr_head_sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = process.env.PR_HEAD_SHA;
+            // Workflow names (not job names) of every run that holds a required check on main.
+            const required = ['CI Pipeline', 'Secret Scan', 'E2E'];
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            // The runs appear a few seconds after the push; wait until all of them exist.
+            let runs = [];
+            for (let attempt = 0; attempt < 18; attempt += 1) {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner,
+                repo,
+                event: 'pull_request',
+                head_sha: headSha,
+                per_page: 50,
+              });
+              runs = data.workflow_runs.filter((run) => run.head_repository?.full_name === `${owner}/${repo}`);
+              if (required.every((name) => runs.some((run) => run.name === name))) break;
+              await sleep(10000);
+            }
+
+            const failures = required
+              .filter((name) => !runs.some((run) => run.name === name))
+              .map((name) => `${name}: no run was created for ${headSha.slice(0, 7)}`);
+            for (const run of runs) {
+              if (run.conclusion !== 'action_required' && run.status !== 'action_required') {
+                core.info(`${run.name} is not held (${run.status}${run.conclusion ? `/${run.conclusion}` : ''}).`);
+                continue;
+              }
+              try {
+                await github.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
+                core.info(`Approved ${run.name} (run ${run.id}).`);
+              } catch (error) {
+                failures.push(`${run.name}: ${error.message}`);
+              }
+            }
+            if (failures.length === 0) return;
+
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body: [
+                '### Checks are waiting for approval',
+                '',
+                `The [implementer run](${runUrl}) could not start this PR's checks, so they will not report and the PR cannot merge yet:`,
+                '',
+                ...failures.map((failure) => `- \`${failure}\``),
+                '',
+                'Click **Approve workflows to run** at the bottom of this PR to start them.',
+              ].join('\n'),
+            });
+            core.setFailed(`Could not start: ${failures.join('; ')}`);

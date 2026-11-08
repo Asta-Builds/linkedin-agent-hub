@@ -1,0 +1,51 @@
+title = "LinkedIn Agent Hub secret scan (Gitleaks 8.24)"
+
+# Gitleaks regexes are Go RE2: no lookahead or lookbehind. Use [[rules.allowlists]] instead.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "agent-hub-token"
+description = "LinkedIn Agent Hub agent token (lah_...), which grants MCP access"
+regex = '''\b(lah_[A-Za-z0-9_-]{43})\b'''
+secretGroup = 1
+tags = ["token", "agent"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key or Claude OAuth token"
+regex = '''(?i)\b(sk-ant-(?:api03|oat01|sid01)-[a-zA-Z0-9_\-]{20,})\b'''
+secretGroup = 1
+tags = ["key", "anthropic"]
+
+[[rules]]
+id = "hardcoded-database-password"
+description = "PostgreSQL URL with a password in it"
+regex = '''(?i)\bpostgres(?:ql)?://[^:\s/@]+:([^@\s/]{8,})@[^\s"'`]+'''
+secretGroup = 1
+tags = ["database", "password"]
+
+    # Local and CI service hosts carry throwaway passwords.
+    [[rules.allowlists]]
+    regexTarget = "match"
+    regexes = ['''@(?:localhost|127\.0\.0\.1|postgres|db)(?:[:/]|$)''']
+
+    # ${POSTGRES_PASSWORD} and similar are placeholders, not secrets.
+    [[rules.allowlists]]
+    regexes = ['''^\$\{[A-Z0-9_]+\}$''']
+
+[[rules]]
+id = "generic-secret-assignment"
+description = "Password, key, token or client secret assigned a literal in source code"
+regex = '''(?i)(?:password|passwd|secret|api_key|apikey|access_token|auth_token|client_secret|encryption_key)\s*[:=]\s*["']([a-zA-Z0-9_\-+/=!@#$%^&*.]{16,})["']'''
+secretGroup = 1
+entropy = 3.5
+tags = ["password", "secret"]
+
+# Global allowlist. The lockfile holds integrity hashes, not secrets. Everything else is
+# scanned, tests and .env.example included: only the known CI dummy values are excused.
+[allowlist]
+description = "Lockfile and CI dummy values"
+paths = ['''(^|/)package-lock\.json$''']
+regexes = ['''test_password''', '''example\.invalid''']
