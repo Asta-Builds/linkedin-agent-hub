@@ -17,3 +17,5 @@
 /src/server/env.ts            @Asta-Builds
 /src/server/mcp/auth.ts       @Asta-Builds
 /src/app/api/mcp/             @Asta-Builds
+/vercel.json                  @Asta-Builds
+/scripts/vercel-build.mjs     @Asta-Builds
